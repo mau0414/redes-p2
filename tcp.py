@@ -47,7 +47,16 @@ class Servidor:
 
         elif id_conexao in self.conexoes:
             # Passa para a conexão adequada se ela já estiver estabelecida
+
             self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, payload)
+
+            if (flags & FLAGS_FIN) == FLAGS_FIN:
+                dados = b''
+                self.conexoes[id_conexao].callback(self, dados)
+                self.conexoes[id_conexao].fechar()
+                
+                self.conexoes.pop(id_conexao)
+
         else:
             print('%s:%d -> %s:%d (pacote associado a conexão desconhecida)' %
                   (src_addr, src_port, dst_addr, dst_port))
@@ -87,6 +96,10 @@ class Conexao:
         # print('recebido payload: %r' % payload)
 
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
+
+        # se recebe segmento setado como fin de seq_no = x, responde ack = x+1 para indicar recebimento
+        if (flags & FLAGS_FIN | FLAGS_ACK) == FLAGS_FIN | FLAGS_ACK:
+            self.seq_no_to_receive += 1
 
         # garante que pacote que chegou eh o esperado e na ordem
         # len(payload) > 0 garante que recebimento de pacote ack nao gera resposta
@@ -147,4 +160,8 @@ class Conexao:
         Usado pela camada de aplicação para fechar a conexão
         """
         # TODO: implemente aqui o fechamento de conexão
-        pass
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
+
+        header = make_header(dst_port, src_port, self.seq_no_to_send, self.seq_no_to_receive, FLAGS_FIN | FLAGS_ACK)
+        header = fix_checksum(header, dst_addr, src_addr)
+        self.servidor.rede.enviar(header, src_addr)
