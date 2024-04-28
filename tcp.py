@@ -67,9 +67,8 @@ class Conexao:
         self.servidor = servidor
         self.id_conexao = id_conexao
         self.callback = None
-        self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
-        #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
-
+        # [ (unacked_segment_no, payload), ... ]
+        self.unacked_segments = []
         src_addr, src_port, dst_addr, dst_port = id_conexao
 
         # criacao de header invertendo origem e destino e passando seq_no_y e ack de recebimento de seq_no
@@ -86,7 +85,16 @@ class Conexao:
 
     def _exemplo_timer(self):
         # Esta função é só um exemplo e pode ser removida
-        print('Este é um exemplo de como fazer um timer')
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
+        # informacoes do segmento perdido para reenviar
+        last_unacked_segment_seq_no = self.unacked_segments[0][0] 
+        last_unacked_segment_data = self.unacked_segments[0][1]
+        
+        # reenvio do segmento
+        segmento = make_header(dst_port, src_port, last_unacked_segment_seq_no, self.seq_no_to_receive, FLAGS_ACK)
+        segmento = fix_checksum(segmento+last_unacked_segment_data, dst_addr, src_addr)
+        self.servidor.rede.enviar(segmento, src_addr)
+
 
     # funcao que recebe pacotes da conexao ja estabelecida
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
@@ -100,6 +108,26 @@ class Conexao:
         # se recebe segmento setado como fin de seq_no = x, responde ack = x+1 para indicar recebimento
         if (flags & FLAGS_FIN | FLAGS_ACK) == FLAGS_FIN | FLAGS_ACK:
             self.seq_no_to_receive += 1
+
+        # se chegou algum ack
+        if (flags & FLAGS_ACK) ==  FLAGS_ACK and len(self.unacked_segments) > 0:
+            
+            oldest_unacked_no = self.unacked_segments[0][0]
+            oldest_unacked_data = self.unacked_segments[0][1]
+
+            # se ack for do segmento mais antigo enviado cancela timer
+            if (ack_no == oldest_unacked_no + len(oldest_unacked_data)):
+                self.timer.cancel()
+    
+            # marca como acked segmentos unacked considerando ack cumulativo
+            for unacked_segment in self.unacked_segments:
+                if unacked_segment[0] + len(unacked_segment[1]) <= ack_no:
+                    self.unacked_segments.pop(0)
+
+            # se restou segmentos unacked reinicia timer 
+            if (len(unacked_segment) > 0):
+                self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
+
 
         # garante que pacote que chegou eh o esperado e na ordem
         # len(payload) > 0 garante que recebimento de pacote ack nao gera resposta
@@ -152,7 +180,10 @@ class Conexao:
             self.servidor.rede.enviar(segmento, src_addr)
 
             # atualiza proximo seq_no a enviar
+            self.unacked_segments.append((self.seq_no_to_send, payload))
             self.seq_no_to_send += len(payload)
+            if (len(self.unacked_segments) == 1):
+                self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
 
 
     def fechar(self):
