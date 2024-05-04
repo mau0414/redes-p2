@@ -76,6 +76,8 @@ class Conexao:
         self.estimated_rtt = None
         self.alpha = 0.125
         self.beta = 0.25
+        self.dados = None
+        self.cwnd = 1
 
         # criacao de header invertendo origem e destino e passando seq_no_y e ack de recebimento de seq_no
         header = make_header(dst_port, src_port, seq_no, seq_no+1, FLAGS_ACK | FLAGS_SYN)
@@ -89,7 +91,8 @@ class Conexao:
         self.seq_no_to_send = seq_no + 1 # proximo seq_no a enviar (seq_no acabou de ser enviado)
         self.seq_no_to_receive = ack_no # prox seq_no a receber
 
-    def _exemplo_timer(self):
+    def handle_timer(self):
+        self.cwnd = self.cwnd // 2
         # Esta função é só um exemplo e pode ser removida
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
         # informacoes do segmento perdido para reenviar
@@ -102,18 +105,15 @@ class Conexao:
         self.unacked_segments[0][3] = True
         
         # reenvio do segmento
-        print('acabou de reenviar', last_unacked_segment_seq_no, 'em delta', time.time()-initial_time)
-        print('futuro ack', last_unacked_segment_seq_no + len(last_unacked_segment_data))
         segmento = make_header(dst_port, src_port, last_unacked_segment_seq_no, self.seq_no_to_receive, FLAGS_ACK)
         segmento = fix_checksum(segmento+last_unacked_segment_data, dst_addr, src_addr)
         self.servidor.rede.enviar(segmento, src_addr)
 
         # reinicia timer para segmento reenviado
-        self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self._exemplo_timer)
+        self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self.handle_timer)
 
 
     def update_estimated_rtt(self, sample_rtt):
-        print('sample rtt', sample_rtt)
         if (self.timeout_interval == 1):
             self.estimated_rtt = sample_rtt
         else:
@@ -131,14 +131,12 @@ class Conexao:
         self.update_dev_rtt(sample_rtt)
 
         self.timeout_interval = self.estimated_rtt + 4*self.dev_rtt
-        print('new timeout', self.timeout_interval)
 
     # funcao que recebe pacotes da conexao ja estabelecida
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
-        # print('recebido payload: %r' % payload)
 
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
@@ -149,8 +147,9 @@ class Conexao:
         # se chegou algum ack
         if (flags & FLAGS_ACK) ==  FLAGS_ACK and len(self.unacked_segments) > 0:
 
+            # achar maneira de incrementar cwnd conforme recebe-se um ack de uma janela inteira 
+
             receive_time = time.time()
-            print('chegou ack', ack_no)
 
             # self.seq_no_to_receive = sendBase
             if (ack_no > self.seq_no_to_send):
@@ -164,12 +163,14 @@ class Conexao:
                     break
 
             self.unacked_segments = [unacked_segment for unacked_segment in self.unacked_segments if unacked_segment[0] >= ack_no]
-            print('filtrado:')
-            self.show_unacked_elements()
             if len(self.unacked_segments) > 0:
-                self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self._exemplo_timer)
+                self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self.handle_timer)
             else:
                 self.timer.cancel()
+                self.cwnd += 1
+
+            if (len(self.dados) > 0):
+                self.enviar(self.dados, reenvio=True)
 
 
         # garante que pacote que chegou eh o esperado e na ordem
@@ -203,7 +204,7 @@ class Conexao:
     # como receptor, e não como transmissor, mas aqui misturamos os papéis.
 
     # funcao para enviar dados da aplicacao para rede
-    def enviar(self, dados):
+    def enviar(self, dados, reenvio=False):
         """
         Usado pela camada de aplicação para enviar dados
         """
@@ -212,13 +213,17 @@ class Conexao:
         # que você construir para a camada de rede.
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
-        while len(dados) > 0:
+        if (self.dados is None):
+            self.dados = dados
+        elif not reenvio:
+            self.dados += dados
+        while len(self.dados) > 0 and len(self.unacked_segments) < self.cwnd:
 
             # limita payload a MSS (Maximum Segment Size) para evitar flow problems
-            payload = dados[:MSS]
+            payload = self.dados[:MSS]
 
             # eventuais dados que sobraram
-            dados = dados[MSS:]
+            self.dados = self.dados[MSS:]
 
             segmento = make_header(dst_port, src_port, self.seq_no_to_send, self.seq_no_to_receive, FLAGS_ACK)
             segmento = fix_checksum(segmento+payload, dst_addr, src_addr)
@@ -227,23 +232,9 @@ class Conexao:
 
             # atualiza proximo seq_no a enviar
             self.unacked_segments.append([self.seq_no_to_send, payload, sending_time, False])
-            # print('enviou segmento', self.seq_no_to_send, 'no tempo', sending_time)
-            # print('tamanho fila', len(self.unacked_segments))
-            # print('futuro ack', self.seq_no_to_send + len(payload), '\n')
             self.seq_no_to_send += len(payload)
             if (len(self.unacked_segments) == 1):
-                self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self._exemplo_timer)
-
-            # self.show_unacked_elements()
-
-    def show_unacked_elements(self):
-
-        print('unacked segments:')
-        for unacked_segment in self.unacked_segments:
-
-            print(unacked_segment[0])
-
-        print('\n')
+                self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self.handle_timer)
 
     def fechar(self):
         """
